@@ -2,9 +2,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 module Main (
     main
 ) where
+
+import Data.Semigroup
+import Data.Text (Text)
+import System.IO.Temp
+
+import System.Linux.Namespaces
+import System.Posix
+import System.Process
+import Control.Monad.Catch
 
 import Test.DocTest
 import System.IO (stderr, BufferMode(..), stdout, hSetBuffering)
@@ -13,14 +23,27 @@ import System.Exit (exitFailure, exitWith, ExitCode(..))
 import System.Process (readProcess, system)
 import Control.Concurrent
        (takeMVar, newEmptyMVar, forkIO, threadDelay, putMVar)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO(..))
 import Data.Monoid ((<>))
 import System.Environment (getArgs)
 import Test.WebDriver (runSession, defaultConfig, openPage, closeSession)
+import Test.WebDriver.Class (WebDriver)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Test.WebDriver as WD
+import qualified Test.WebDriver.Capabilities as WD
+
+seleniumPort, jsaddlePort :: Int
+seleniumPort = 8000
+jsaddlePort = 8001
+
+chromeConfig :: Text -> [Text] -> WD.WDConfig
+chromeConfig fp flags = WD.useBrowser (WD.chrome { WD.chromeBinary = Just $ T.unpack fp, WD.chromeOptions = T.unpack <$> flags }) WD.defaultConfig
 
 main :: IO ()
 main = do
+    -- unshareNetork
     putStrLn "Testing JSaddle"
     jsaddlePath <- getArgs >>= \case
         [arg] -> return arg
@@ -29,19 +52,24 @@ main = do
             exitFailure
     hSetBuffering stdout LineBuffering
     hSetBuffering stderr LineBuffering
-    putStrLn "Checking for phantomjs"
-    node <- system "phantomjs --version" >>= \case
-                ExitSuccess -> return ()
-                e           -> do
-                    putStrLn "phantomjs not found"
-                    exitWith e
-    putStrLn "Starting phantomjs"
-    forkIO . void $ readProcess "phantomjs" ["--webdriver=4444"] "" >>= putStr
-    threadDelay 5000000
-    putStrLn "Running Tests"
-    done <- newEmptyMVar
-    forkIO $ do
-        liftIO $ doctest [
+    -- isHeadless <- (== Nothing) <$> lookupEnv "NO_HEADLESS"
+    let isHeadless = False
+    withSandboxedChromeFlags isHeadless $ \chromeFlags -> do
+      withSeleniumServer $ \selenium -> do
+        let browserPath = "chromium"
+        when (T.null browserPath) $ fail "No browser found"
+        -- withDebugging <- isNothing <$> lookupEnv "NO_DEBUG"
+        let wdConfig = WD.useBrowser WD.chrome $ WD.defaultConfig { WD.wdPort = fromIntegral $ _selenium_portNumber selenium }
+            chromeCaps' = WD.getCaps $ chromeConfig browserPath chromeFlags
+            -- session' = sessionWith wdConfig "" . using (map (,"") caps)
+        runSession wdConfig (tests jsaddlePath) `finally` _selenium_stopServer selenium
+  where
+  tests :: (WebDriver m, MonadIO m) => String -> m ()
+  tests jsaddlePath = do
+    liftIO $ putStrLn "Running Tests"
+    done <-  liftIO $ newEmptyMVar
+    liftIO $ forkIO $ do
+        doctest [
             "-hide-all-packages",
             "-package=base-" ++ VERSION_base,
             "-package=lens-" ++ VERSION_lens,
@@ -105,8 +133,48 @@ main = do
             jsaddlePath </> "src/Language/Javascript/JSaddle/Types.hs",
             jsaddlePath </> "src/Language/Javascript/JSaddle/Value.hs" ]
         putMVar done ()
-    threadDelay 5000000
-    runSession defaultConfig $ do
-        openPage "http://127.0.0.1:3709"
-        liftIO $ takeMVar done
-        closeSession
+    liftIO $ threadDelay 5000000
+    openPage "http://127.0.0.1:3709"
+    liftIO $ takeMVar done
+    closeSession
+
+withSandboxedChromeFlags :: Bool -> ([Text] -> IO a) -> IO a
+withSandboxedChromeFlags headless action =
+  withSystemTempDirectory "reflex-dom-core_test" $ \tmp ->
+    action
+      [ if headless then "--headless" else "--auto-open-devtools-for-tabs"
+      , "--disable-gpu"
+      , "--no-sandbox"
+      , "--remote-debugging-port=9222"
+      , "--user-data-dir=" <> T.pack tmp
+      ]
+
+unshareNetork :: IO ()
+unshareNetork = do
+  uid <- getEffectiveUserID
+  unshare [User, Network]
+  writeUserMappings Nothing [UserMapping 0 uid 1]
+  callCommand "ip link set lo up ; ip addr"
+
+data Selenium = Selenium
+  { _selenium_portNumber :: Int
+  , _selenium_stopServer :: IO ()
+  }
+
+startSeleniumServer :: Int -> IO (IO ())
+startSeleniumServer port = do
+  (_,_,_,ph) <- createProcess $ (proc "selenium-server" ["-port", show port])
+    { std_in = NoStream
+    , std_out = NoStream
+    , std_err = NoStream
+    }
+  return $ terminateProcess ph
+
+withSeleniumServer :: (Selenium -> IO ()) -> IO ()
+withSeleniumServer f = do
+  stopServer <- startSeleniumServer seleniumPort
+  threadDelay $ 1000 * 1000 * 2 -- TODO poll or wait on a a signal to block on
+  f $ Selenium
+    { _selenium_portNumber = seleniumPort
+    , _selenium_stopServer = stopServer
+    }
